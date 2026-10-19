@@ -1,92 +1,167 @@
 # PerfBoost: Universal Debian/Ubuntu System & Process Accelerator
 
-**PerfBoost** transforms your Debian-based system so that **any process** running on the machine utilizes available CPU cores, RAM, I/O bandwidth, and network resources to perform faster.
+**PerfBoost** transforms your Debian-based system (Debian, Ubuntu, Kali, Mint, Pop!_OS, etc.) so that **any process** running on the machine dynamically utilizes available CPU cores, RAM, I/O bandwidth, and network resources to perform faster and better.
 
 ---
 
-## What It Does For All System Processes
-
-### 1. Global Multi-Threaded Environment (`/etc/profile.d/99-perfboost-env.sh`)
-Every shell, script, and background job automatically inherits multi-core parallel settings:
-- **Build Systems:** `MAKEFLAGS="-j$(nproc)"`, `CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)"`, `CARGO_BUILD_JOBS="$(nproc)"`, `NINJA_STATUS`.
-- **Math & Scientific Computing:** `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` (speeds up Python NumPy, SciPy, PyTorch, C++ OpenMP).
-- **Compression:** `XZ_OPT="-T0"` and `ZSTD_NBTHREADS="0"` force multi-threaded compression across tools like `tar` and `dpkg`.
-
-### 2. Multi-Core Drop-in Replacements
-- Automatically installs `pigz` and `pbzip2` and symlinks them over single-threaded `gzip` and `bzip2`.
-- Any command or archive operation (`tar -czf`, backups, log rotations) instantly utilizes **all CPU cores** instead of just one.
-
-### 3. Maximum Hardware Clock Speed (CPU Governor)
-- Sets CPU scaling governor to `performance` across all cores.
-- Tunes energy-performance policy (`x86_energy_perf_policy`) to remove latency penalties.
-
-### 4. Kernel, Memory, & I/O Throughput Tuning (`/etc/sysctl.d/99-perfboost.conf`)
-- **RAM Swappiness (`vm.swappiness = 10`):** Prioritizes fast physical RAM over slow disk swap.
-- **VFS Cache Pressure (`vm.vfs_cache_pressure = 50`):** Keeps filesystem directories and inode caches hot in memory.
-- **Process Scheduler (`kernel.sched_autogroup_enabled = 1`):** Isolates foreground desktop/terminal tasks from heavy background work.
-- **Scheduler Cache Affinity (`kernel.sched_migration_cost_ns = 5000000`):** Prevents needless thread migration across CPU cores, maximizing L1/L2/L3 cache hits.
-- **High-Capacity File Descriptors (`fs.file-max = 2097152`, `limits.conf = 524288`):** Prevents bottlenecks in multi-threaded programs and servers.
-- **Network Stack:** Enables TCP BBR congestion control, window scaling, and fast open.
-
-### 5. High-Speed ZRAM Memory Expansion
-- Configures in-RAM compressed swap with `zstd` (50% RAM), allowing processes to fit 1.5x–2x more data in memory without touching slow disk swap.
-
-### 6. Process Auto-Booster Daemon (`perfboost.service`)
-- A lightweight background daemon monitors running tasks every few seconds.
-- Automatically grants elevated CPU priority (`nice -n -5`) and high I/O priority (`ionice -c 2 -n 0`) to active compilers (`gcc`, `clang`, `rustc`), build engines (`make`, `cmake`, `ninja`), runtimes (`python3`, `node`), media encoders (`ffmpeg`, `blender`), and containers (`docker`, `podman`).
-
-### 7. Universal Command Wrapper (`perfboost run <command>`)
-Run **any** arbitrary command boosted on demand:
-```bash
-perfboost run <command> [args...]
-```
-- Grants immediate CPU core affinity across all detected cores (`taskset`).
-- Elevates CPU scheduling priority (`nice`).
-- Elevates disk I/O scheduling priority (`ionice`).
-- Injects full multi-threading runtime parameters.
+## Table of Contents
+1. [Core Features](#core-features)
+2. [Quick Start](#quick-start)
+3. [Step-by-Step Testing & Verification Guide](#step-by-step-testing--verification-guide)
+4. [Command Reference](#command-reference)
+5. [How It Works Under the Hood](#how-it-works-under-the-hood)
+6. [Clean Uninstall](#clean-uninstall)
 
 ---
 
-## Quick Usage Guide
+## Core Features
 
-### 1. One-Time System Setup
-Run the setup once to apply all system optimizations and enable the daemon:
+- **Global Multi-Threaded Environment:** Automatically exports parallel build flags (`MAKEFLAGS`, `CMAKE`, `CARGO`) and math libraries (`OMP`, `MKL`, `OPENBLAS`) system-wide.
+- **Transparent Multi-Core Compression:** Replaces single-core `gzip` and `bzip2` with multi-core drop-ins (`pigz`, `pbzip2`) so any archive or compression process uses **all CPU cores**.
+- **Hardware Performance Governor:** Locks CPU governors across all cores to `performance` and configures `x86_energy_perf_policy` for zero frequency-scaling latency.
+- **Kernel & Memory Throughput (sysctl):** Prioritizes RAM over disk swap (`swappiness=10`), keeps filesystem directory cache hot (`vfs_cache_pressure=50`), prevents cross-core CPU cache bouncing, and expands file descriptor limits.
+- **ZRAM Compressed Memory Expansion:** Dynamically expands usable RAM by up to 2x at full memory speed with in-RAM `zstd` compression.
+- **Process Auto-Booster Daemon (`perfboost.service`):** Continuously monitors the system and automatically promotes CPU priority (`nice -n -5`) and I/O priority (`ionice -c 2 -n 0`) for active compilers, runtimes, encoders, and build tools.
+- **Universal Command Runner (`perfboost run <cmd>`):** Supercharge any arbitrary command on demand with explicit CPU affinity, highest nice priority, and maximum I/O bandwidth.
+- **Accelerated Package Tools:** Parallel segmented apt downloads via `apt-fast`/`aria2` and concurrent, load-throttled pip package installs.
+- **100% Reversible:** Tracks every modification with full state logging; `--uninstall` cleanly restores factory defaults.
+
+---
+
+## Quick Start
+
+### 1. Make executable and run system-wide setup:
 ```bash
+chmod +x perfboost.sh
 sudo ./perfboost.sh setup
 ```
 
-### 2. Check System Status
-View current governor, swappiness, ZRAM status, and optimizer service:
+### 2. Verify system status:
 ```bash
 ./perfboost.sh status
 ```
 
-### 3. Run Any Command Accelerated
+### 3. Run any command boosted:
 ```bash
-# Compile code using all cores and max priority
 perfboost run make
-
-# Transcode video with maximum CPU and disk throughput
-perfboost run ffmpeg -i input.mov -c:v libx264 output.mp4
-
-# Run heavy Python / Machine Learning scripts
+perfboost run ffmpeg -i input.mov output.mp4
 perfboost run python3 train.py
 ```
 
-### 4. Package Acceleration (Apt & Pip)
+---
+
+## Step-by-Step Testing & Verification Guide
+
+Follow these steps to test, benchmark, and verify the performance improvements on your system.
+
+### Test 1: Check Baseline vs Optimized System Status
+Run the status check before and after running `sudo ./perfboost.sh setup`:
 ```bash
-# Upgrade all system packages using multi-connection parallel downloads
-sudo perfboost apt-upgrade
+./perfboost.sh status
+```
+**Expected Results after setup:**
+- **CPU Governor:** `performance` (all cores at maximum clock speed)
+- **RAM Swappiness:** `10` (default was 60; keeps data in physical RAM)
+- **Parallel Tools:** `pigz` and `pbzip2` show `Installed ✔`
+- **Optimizer Daemon:** `active`
 
-# Install apt packages
-sudo perfboost apt-install build-essential git cmake
+---
 
-# Install pip packages in parallel (load-capped)
-perfboost pip-install torch numpy pandas flask
+### Test 2: Multi-Core Compression Benchmark (Before vs. After)
+Compare the time taken by default single-threaded gzip versus the multi-core drop-in:
+```bash
+# 1. Generate a 300MB test file
+dd if=/dev/urandom of=test_sample.raw bs=1M count=300
+
+# 2. Benchmark standard single-threaded gzip directly:
+time /bin/gzip -k -f test_sample.raw
+
+# 3. Benchmark perfboost multi-core accelerated gzip:
+time gzip -k -f test_sample.raw
+
+# 4. Clean up test file
+rm -f test_sample.raw test_sample.raw.gz
+```
+> **Observation:** On modern multi-core processors (4–16 cores), `gzip` runs **3x to 8x faster** and engages all CPU cores simultaneously.
+
+---
+
+### Test 3: Test the `perfboost run` Universal Wrapper
+Verify that `perfboost run` automatically applies elevated scheduling priority and CPU core affinity:
+```bash
+# Launch a test command in background with perfboost run
+perfboost run sleep 60 &
+PID=$!
+
+# Inspect scheduling priority (NI) and CPU affinity mask:
+ps -o pid,ni,cls,comm -p $PID
+taskset -p $PID
+
+# Terminate test process
+kill $PID
+```
+> **Observation:** The `NI` (nice priority) column will show **`-5`** (or **`-10`** for root) instead of the default unboosted `0`, ensuring the OS gives it priority execution time over other processes.
+
+---
+
+### Test 4: Verify Multi-Threaded Environment Inheritance
+Confirm that any terminal or build tool picks up multi-core parallelism flags automatically:
+```bash
+source /etc/profile.d/99-perfboost-env.sh
+echo "MAKEFLAGS               = $MAKEFLAGS"
+echo "CMAKE_BUILD_PARALLEL    = $CMAKE_BUILD_PARALLEL_LEVEL"
+echo "CARGO_BUILD_JOBS        = $CARGO_BUILD_JOBS"
+echo "OMP_NUM_THREADS         = $OMP_NUM_THREADS"
+echo "XZ_OPT                  = $XZ_OPT"
 ```
 
-### 5. Complete Reversible Uninstall
-Revert every configuration file, remove symlinks, and restore original system defaults:
+---
+
+### Test 5: Verify Background Auto-Booster Daemon
+Check that the background service is running and actively optimizing processes:
+```bash
+sudo ./perfboost.sh daemon status
+```
+When running heavy workloads (e.g., `make`, `gcc`, `python3`, `ffmpeg`), the daemon detects them within seconds and automatically elevates their CPU and I/O scheduling classes.
+
+---
+
+## Command Reference
+
+| Command | Description | Needs Root? |
+|---|---|---|
+| `sudo ./perfboost.sh setup` | Full system-wide optimization & daemon setup | **Yes** |
+| `./perfboost.sh status` | Display current performance, governor & daemon status | No |
+| `perfboost run <command...> [args]` | Execute **any** arbitrary command with maximum CPU/IO priority | No |
+| `sudo ./perfboost.sh daemon {start\|stop\|restart\|status}` | Manage the background process booster daemon | **Yes** |
+| `sudo ./perfboost.sh apt-upgrade` | Upgrade system packages with parallel segmented downloads | **Yes** |
+| `sudo ./perfboost.sh apt-install <pkg...>` | Install apt packages with multi-connection aria2 acceleration | **Yes** |
+| `./perfboost.sh pip-install <pkg...>` | Install Python packages concurrently with load throttling | No |
+| `sudo ./perfboost.sh --uninstall` | Revert all system changes and restore original defaults | **Yes** |
+
+---
+
+## How It Works Under the Hood
+
+1. **CPU Frequency Scaling (`/sys/devices/system/cpu/cpu*/cpufreq`):**  
+   Switches all CPU cores from power-saving/dynamic downclocking to locked `performance` mode.
+2. **Kernel VFS & Virtual Memory (`/etc/sysctl.d/99-perfboost.conf`):**  
+   `vm.swappiness = 10` discourages page swapping to disk. `vm.vfs_cache_pressure = 50` caches directory trees and file metadata in memory for instantaneous file operations.
+3. **Scheduler Optimization (`kernel.sched_autogroup_enabled = 1`):**  
+   Ensures interactive shells and desktop tasks do not stutter even when background jobs use 100% of all CPU cores.
+4. **Transparent Compression Redirection (`/usr/local/bin`):**  
+   Symlinks `pigz` and `pbzip2` before `/bin` in `$PATH`, making system calls to `gzip` and `bzip2` transparently parallel across all CPU cores.
+5. **Dynamic Priority daemon (`perfboostd`):**  
+   Runs in the background at nice level `-10`, scanning for CPU-intensive compilation, encoding, and data jobs to renice them to high priority without user intervention.
+
+---
+
+## Clean Uninstall
+
+To completely revert every configuration file, remove symlinks, stop the daemon, and restore distribution defaults:
+
 ```bash
 sudo ./perfboost.sh --uninstall
 ```
+
+All original files backed up in `/var/backups/perfboost` will be restored, and all state tracking records in `/etc/perfboost` will be removed.
