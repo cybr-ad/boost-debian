@@ -36,6 +36,8 @@ Once installed with `sudo ./perfbst setup`, it is available everywhere simply as
 ### 1. One-Time Setup:
 Make the script executable and run the setup (this installs `perfbst` to `/usr/local/bin`):
 ```bash
+git clone https://github.com/cybr-ad/boost-debian.git
+cd boost-debian 
 chmod +x perfbst perfboost.sh
 sudo ./perfbst setup
 ```
