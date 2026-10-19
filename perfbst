@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+#
+# perfbst — Universal System & Process Performance Accelerator
+# Debian-based systems (Debian / Ubuntu / Kali / Mint / Pop!_OS / etc.)
+#
+# Optimizes your entire system so ANY process automatically utilizes
+# available CPU cores, RAM, I/O bandwidth, and cache for maximum speed.
+#
+# Key Features:
+#   1. System-wide Multi-Threading:
+#      - Injects multi-core env vars (MAKEFLAGS, CMAKE, CARGO, OMP, MKL, OPENBLAS).
+#      - Configures multi-threaded compression (XZ_OPT, ZSTD, pigz, pbzip2).
+#      - Replaces single-core gzip/bzip2 with parallel drop-in replacements.
+#   2. Hardware Resource Acceleration:
+#      - Sets CPU governor to "performance" across all cores.
+#      - Tunes kernel & virtual memory (swappiness, dirty ratios, vfs_cache_pressure).
+#      - Tunes network buffers & TCP throughput.
+#      - Enables high-speed compressed ZRAM memory expansion.
+#   3. Process Booster & Daemon:
+#      - 'run' subcommand: Launch ANY arbitrary command with max CPU & I/O priority.
+#      - 'daemon' service: Background daemon dynamically boosts active compilers,
+#        build tools, renderers, and compute tasks.
+#   4. Package Acceleration (Apt + Pip):
+#      - Multi-connection parallel downloads via apt-fast / aria2.
+#      - High-concurrency pip installs via GNU parallel.
+#   5. Short command alias:
+#      - Callable system-wide as 'perfbst'.
+#   6. Reversible:
+#      - Complete state tracking with '--uninstall' to restore factory defaults.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants / Paths
+# ---------------------------------------------------------------------------
+SCRIPT_NAME="perfbst"
+SCRIPT_ALT_NAME="perfboost"
+STATE_DIR="/etc/${SCRIPT_NAME}"
+BACKUP_DIR="/var/backups/${SCRIPT_NAME}"
+STATE_FILE="${STATE_DIR}/installed.state"
+
+BIN_INSTALL_PATH="/usr/local/bin/${SCRIPT_NAME}"
+BIN_ALT_INSTALL_PATH="/usr/local/bin/${SCRIPT_ALT_NAME}"
+
+ENV_PROFILE_CONF="/etc/profile.d/99-${SCRIPT_NAME}-env.sh"
+SYSCTL_CONF="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
+SECURITY_LIMITS_CONF="/etc/security/limits.d/99-${SCRIPT_NAME}.conf"
+CPUFREQ_CONF="/etc/default/cpufrequtils"
+SYSTEMD_SERVICE="/etc/systemd/system/${SCRIPT_NAME}.service"
+
+APT_FAST_CONF="/etc/apt-fast.conf"
+APT_PARALLEL_CONF="/etc/apt/apt.conf.d/99${SCRIPT_NAME}-parallel"
+LOG_FILE="/var/log/${SCRIPT_NAME}.log"
+
+LOAD_TARGET="${PERFBOOST_LOAD_TARGET:-90}"
+
+# ---------------------------------------------------------------------------
+# Colors & Logging
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_RESET='\033[0m'; C_BOLD='\033[1m'
+  C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'; C_BLUE='\033[0;34m'; C_CYAN='\033[0;36m'
+else
+  C_RESET=''; C_BOLD=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''; C_CYAN=''
+fi
+
+_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log()  { printf "${C_BLUE}[%s]${C_RESET} %s\n" "$(_ts)" "$*" | tee -a "$LOG_FILE"; }
+ok()   { printf "${C_GREEN}[%s] ✔${C_RESET} %s\n" "$(_ts)" "$*" | tee -a "$LOG_FILE"; }
+warn() { printf "${C_YELLOW}[%s] !${C_RESET} %s\n" "$(_ts)" "$*" | tee -a "$LOG_FILE"; }
+err()  { printf "${C_RED}[%s] ✘${C_RESET} %s\n" "$(_ts)" "$*" | tee -a "$LOG_FILE" >&2; }
+
+trap 'err "Operation failed at line $LINENO. See ${LOG_FILE} for details."' ERR
+
+# ---------------------------------------------------------------------------
+# Privileges & Resource Discovery
+# ---------------------------------------------------------------------------
+need_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "This command requires root privileges. Please re-run with sudo: sudo ${SCRIPT_NAME} ..."
+    exit 1
+  fi
+}
+
+detect_resources() {
+  CPU_CORES="$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  MEM_TOTAL_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 1048576)"
+  MEM_TOTAL_GB=$(( MEM_TOTAL_KB / 1024 / 1024 ))
+  JOBS="${PERFBOOST_JOBS:-$CPU_CORES}"
+  log "Hardware detected: ${CPU_CORES} CPU cores, ${MEM_TOTAL_GB} GB RAM. Target job slots: ${JOBS}."
+}
+
+# ---------------------------------------------------------------------------
+# State & Backup Management
+# ---------------------------------------------------------------------------
+record_state() {
+  mkdir -p "$STATE_DIR"
+  echo "$1" >> "$STATE_FILE"
+}
+
+backup_if_exists() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    mkdir -p "${BACKUP_DIR}$(dirname "$f")"
+    cp -p "$f" "${BACKUP_DIR}${f}.bak"
+    record_state "RESTORE:${f}"
+  else
+    record_state "DELETE:${f}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Package Installation Helper
+# ---------------------------------------------------------------------------
+ensure_tool() {
+  local bin="$1" pkg="${2:-$1}"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    log "Installing dependency: ${pkg}..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg" >>"$LOG_FILE" 2>&1 || {
+      warn "Failed to install ${pkg} via default repo. Continuing..."
+      return 1
+    }
+    record_state "PKG:${pkg}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Module 1: System-wide Parallel Environment Variables
+# ---------------------------------------------------------------------------
+tune_environment() {
+  log "Configuring system-wide multi-threading environment variables..."
+  backup_if_exists "$ENV_PROFILE_CONF"
+
+  cat > "$ENV_PROFILE_CONF" <<EOF
+# Generated by ${SCRIPT_NAME} — Enables multi-core utilization across all processes
+export MAKEFLAGS="-j\$(nproc 2>/dev/null || echo 2)"
+export CMAKE_BUILD_PARALLEL_LEVEL="\$(nproc 2>/dev/null || echo 2)"
+export NINJA_STATUS="[%f/%t %s] "
+export CARGO_BUILD_JOBS="\$(nproc 2>/dev/null || echo 2)"
+
+# OpenMP / Numeric / Math library multi-threading
+export OMP_NUM_THREADS="\$(nproc 2>/dev/null || echo 2)"
+export MKL_NUM_THREADS="\$(nproc 2>/dev/null || echo 2)"
+export OPENBLAS_NUM_THREADS="\$(nproc 2>/dev/null || echo 2)"
+export NUMEXPR_NUM_THREADS="\$(nproc 2>/dev/null || echo 2)"
+export VECLIB_MAXIMUM_THREADS="\$(nproc 2>/dev/null || echo 2)"
+
+# Multi-core compression utilities
+export XZ_OPT="-T0"
+export ZSTD_NBTHREADS="0"
+export PARALLEL_SHELL="/bin/bash"
+EOF
+  chmod 644 "$ENV_PROFILE_CONF"
+  ok "System-wide parallel environment profile installed (${ENV_PROFILE_CONF})."
+}
+
+# ---------------------------------------------------------------------------
+# Module 2: Multi-Threaded Compression Tools (pigz, pbzip2)
+# ---------------------------------------------------------------------------
+tune_parallel_tools() {
+  log "Configuring multi-threaded compression & acceleration utilities..."
+  ensure_tool pigz pigz || true
+  ensure_tool pbzip2 pbzip2 || true
+  ensure_tool zstd zstd || true
+  ensure_tool aria2c aria2 || true
+  ensure_tool parallel parallel || true
+
+  # Set up drop-in symlinks in /usr/local/bin for gzip/bzip2 to use multi-core equivalents
+  if command -v pigz >/dev/null 2>&1; then
+    if [[ ! -e /usr/local/bin/gzip ]]; then
+      ln -s "$(command -v pigz)" /usr/local/bin/gzip
+      record_state "DELETE:/usr/local/bin/gzip"
+      ok "Transparently redirected 'gzip' -> multi-threaded 'pigz' (all CPU cores)."
+    fi
+  fi
+
+  if command -v pbzip2 >/dev/null 2>&1; then
+    if [[ ! -e /usr/local/bin/bzip2 ]]; then
+      ln -s "$(command -v pbzip2)" /usr/local/bin/bzip2
+      record_state "DELETE:/usr/local/bin/bzip2"
+      ok "Transparently redirected 'bzip2' -> multi-threaded 'pbzip2' (all CPU cores)."
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Module 3: CPU Governor (Maximum Clock Speed & Performance)
+# ---------------------------------------------------------------------------
+tune_cpu_governor() {
+  log "Configuring CPU scaling governor to 'performance'..."
+  local available_governors=""
+  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors ]]; then
+    available_governors="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors)"
+  fi
+
+  if echo "$available_governors" | grep -qw "performance"; then
+    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      [[ -f "$gov" ]] && echo "performance" > "$gov" 2>/dev/null || true
+    done
+
+    # Persist via cpufrequtils if available
+    ensure_tool cpufreq-set cpufrequtils || true
+    if [[ -f "$CPUFREQ_CONF" || -d /etc/default ]]; then
+      backup_if_exists "$CPUFREQ_CONF"
+      echo 'GOVERNOR="performance"' > "$CPUFREQ_CONF"
+      systemctl restart cpufrequtils 2>/dev/null || true
+    fi
+    ok "CPU governors set to 'performance' across all cores."
+  else
+    warn "CPU governor 'performance' not exposed by current hardware/kernel driver. Skipping."
+  fi
+
+  # Optimize energy-performance bias if available (Intel/AMD)
+  if command -v x86_energy_perf_policy >/dev/null 2>&1; then
+    x86_energy_perf_policy performance 2>/dev/null || true
+    ok "Set x86 energy-performance policy to maximum performance."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Module 4: Kernel, Memory, VFS, & Network Throughput (sysctl)
+# ---------------------------------------------------------------------------
+tune_sysctl() {
+  log "Applying kernel, memory, and I/O throughput sysctl parameters..."
+  backup_if_exists "$SYSCTL_CONF"
+
+  cat > "$SYSCTL_CONF" <<EOF
+# ${SCRIPT_NAME} — Maximum system resource throughput configuration
+
+# Virtual Memory: prioritize RAM cache over swapping
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+
+# Smooth asynchronous background disk flushing for high I/O workloads
+vm.dirty_background_ratio = 5
+vm.dirty_ratio = 20
+
+# Scheduler: optimize cache-locality and desktop/multitasking responsiveness
+kernel.sched_autogroup_enabled = 1
+kernel.sched_migration_cost_ns = 5000000
+
+# File descriptor capacity for high-concurrency tasks
+fs.file-max = 2097152
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 1024
+
+# Network throughput & buffer capacity
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 16384
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+
+  # Enable TCP BBR congestion control if kernel module exists
+  if modprobe tcp_bbr 2>/dev/null; then
+    echo "net.core.default_qdisc = fq" >> "$SYSCTL_CONF"
+    echo "net.ipv4.tcp_congestion_control = bbr" >> "$SYSCTL_CONF"
+  fi
+
+  sysctl --system >>"$LOG_FILE" 2>&1 || true
+  ok "Optimized sysctl parameters applied."
+}
+
+# ---------------------------------------------------------------------------
+# Module 5: Process Resource Limits (limits.conf)
+# ---------------------------------------------------------------------------
+tune_limits() {
+  log "Increasing process resource & file descriptor limits..."
+  backup_if_exists "$SECURITY_LIMITS_CONF"
+
+  cat > "$SECURITY_LIMITS_CONF" <<EOF
+# ${SCRIPT_NAME}: prevent 'too many open files' or thread limits during heavy parallel runs
+*       soft    nofile      65535
+*       hard    nofile      524288
+*       soft    nproc       65535
+*       hard    nproc       65535
+root    soft    nofile      524288
+root    hard    nofile      524288
+EOF
+  ok "Process file descriptor and thread limits updated."
+}
+
+# ---------------------------------------------------------------------------
+# Module 6: ZRAM In-Memory Compression (Fast RAM Expansion)
+# ---------------------------------------------------------------------------
+tune_zram() {
+  log "Checking RAM compression (zram) availability..."
+  if ! lsmod | grep -q zram && ! command -v zramctl >/dev/null 2>&1; then
+    modprobe zram 2>/dev/null || true
+  fi
+
+  if command -v zramctl >/dev/null 2>&1 || lsmod | grep -q zram; then
+    ensure_tool zram-tools zram-tools || true
+    if [[ -f /etc/default/zramswap ]]; then
+      backup_if_exists "/etc/default/zramswap"
+      cat > /etc/default/zramswap <<'EOF'
+# ${SCRIPT_NAME} — Fast compressed RAM swap configuration
+ALGO=zstd
+PERCENT=50
+PRIORITY=100
+EOF
+      systemctl restart zramswap 2>/dev/null || true
+      ok "Configured ultra-fast zram compressed memory swap (zstd, 50% RAM)."
+    fi
+  else
+    log "ZRAM kernel module not available in this kernel/container environment. Skipping."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Module 7: APT Package Download Parallelization
+# ---------------------------------------------------------------------------
+tune_apt() {
+  log "Configuring apt parallel downloads and pipelining..."
+  ensure_tool curl curl
+
+  # Install apt-fast for multi-connection downloads if possible
+  if ! command -v apt-fast >/dev/null 2>&1; then
+    ensure_tool software-properties-common software-properties-common || true
+    if add-apt-repository -y ppa:apt-fast/stable >>"$LOG_FILE" 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get update -y >>"$LOG_FILE" 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y apt-fast >>"$LOG_FILE" 2>&1 || true
+      record_state "PKG:apt-fast"
+    fi
+  fi
+
+  if command -v apt-fast >/dev/null 2>&1; then
+    backup_if_exists "$APT_FAST_CONF"
+    cat > "$APT_FAST_CONF" <<EOF
+_APTMGR=apt-get
+DOWNLOADBEFORE=true
+_MAXNUM=$(( CPU_CORES * 2 ))
+_SPLITCON=$(( CPU_CORES * 2 ))
+DLDIR=/var/cache/apt/apt-fast
+_DOWNLOADER='aria2c -c -j \${_MAXNUM} -x \${_SPLITCON} -s \${_SPLITCON} --min-split-size=1M --connect-timeout=10 --max-tries=5 --input-file=\${DLLIST} --dir=/ --auto-file-renaming=false --allow-overwrite=true --continue=true'
+EOF
+    ok "Configured apt-fast (${CPU_CORES}x segmented parallel aria2 connections)."
+  fi
+
+  backup_if_exists "$APT_PARALLEL_CONF"
+  cat > "$APT_PARALLEL_CONF" <<'EOF'
+Acquire::Queue-Mode "host";
+Acquire::http::Pipeline-Depth "10";
+Acquire::Retries "3";
+APT::Get::Fix-Missing "true";
+Dpkg::Options {
+   "--force-confdef";
+};
+EOF
+  ok "Applied parallel pipeline depth to APT."
+}
+
+# ---------------------------------------------------------------------------
+# Module 8: Process Booster Background Daemon (perfboostd)
+# ---------------------------------------------------------------------------
+create_daemon() {
+  log "Setting up ${SCRIPT_NAME} systemd auto-optimization daemon..."
+
+  backup_if_exists "$SYSTEMD_SERVICE"
+  cat > "$SYSTEMD_SERVICE" <<EOF
+[Unit]
+Description=Universal Process Performance Booster Daemon (${SCRIPT_NAME})
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${BIN_INSTALL_PATH} daemon-loop
+Restart=always
+RestartSec=10
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+  systemctl enable "${SCRIPT_NAME}.service" >>"$LOG_FILE" 2>&1 || true
+  systemctl restart "${SCRIPT_NAME}.service" >>"$LOG_FILE" 2>&1 || true
+  ok "Background performance optimizer daemon enabled and started."
+}
+
+# Daemon loop that detects heavy/compiler/compute processes and boosts them
+daemon_loop() {
+  need_root
+  log "Starting ${SCRIPT_NAME} background process optimizer loop..."
+
+  # Target process names to actively prioritize
+  local TARGET_PROCS=(
+    "gcc" "g++" "clang" "clang++" "cc1" "cc1plus" "as" "ld" "gold" "mold" "lld"
+    "make" "ninja" "cmake" "cargo" "rustc" "go" "javac"
+    "python" "python3" "node" "ffmpeg" "blender" "handbrake"
+    "docker" "containerd" "podman"
+  )
+
+  while true; do
+    for proc in "${TARGET_PROCS[@]}"; do
+      # Find PIDs of active processes matching name
+      local pids
+      pids="$(pgrep -x "$proc" 2>/dev/null || true)"
+      if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+          # Check current nice value
+          local cur_nice
+          cur_nice="$(awk '{print $19}' "/proc/${pid}/stat" 2>/dev/null || echo 0)"
+          if [[ "$cur_nice" -gt -5 ]]; then
+            renice -n -5 -p "$pid" >/dev/null 2>&1 || true
+            ionice -c 2 -n 0 -p "$pid" >/dev/null 2>&1 || true
+          fi
+        done
+      fi
+    done
+    sleep 3
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Setup Master Command
+# ---------------------------------------------------------------------------
+cmd_setup() {
+  need_root
+  detect_resources
+  log "=== Starting Full Universal System Performance Setup ==="
+
+  # 1. Self-install to /usr/local/bin as 'perfbst' and 'perfboost'
+  mkdir -p "$(dirname "$BIN_INSTALL_PATH")"
+  cp -p "$0" "$BIN_INSTALL_PATH"
+  chmod 755 "$BIN_INSTALL_PATH"
+  record_state "DELETE:${BIN_INSTALL_PATH}"
+
+  # Also symlink perfboost -> perfbst for full compatibility
+  ln -sf "$BIN_INSTALL_PATH" "$BIN_ALT_INSTALL_PATH"
+  record_state "DELETE:${BIN_ALT_INSTALL_PATH}"
+  ok "Installed executable command: '${SCRIPT_NAME}' (and alias '${SCRIPT_ALT_NAME}')."
+
+  # 2. Configure Environment Variables
+  tune_environment
+
+  # 3. Parallel Compression Tools
+  tune_parallel_tools
+
+  # 4. CPU Governor
+  tune_cpu_governor
+
+  # 5. Sysctl (Kernel, VM, Network)
+  tune_sysctl
+
+  # 6. Security Limits
+  tune_limits
+
+  # 7. ZRAM
+  tune_zram
+
+  # 8. APT parallelization
+  tune_apt
+
+  # 9. Process Booster Background Daemon
+  create_daemon
+
+  record_state "DONE"
+  echo ""
+  ok "=================================================================="
+  ok "  UNIVERSAL SYSTEM OPTIMIZATION COMPLETE!"
+  ok "  You can now run directly from anywhere:"
+  ok "    ${SCRIPT_NAME} run <command>     -> Run any command with max speed"
+  ok "    ${SCRIPT_NAME} status            -> Check system resource status"
+  ok "    sudo ${SCRIPT_NAME} apt-upgrade  -> Parallel full system upgrade"
+  ok "    ${SCRIPT_NAME} pip-install <pkg> -> Fast parallel pip install"
+  ok "    sudo ${SCRIPT_NAME} --uninstall  -> Revert all changes"
+  ok "=================================================================="
+}
+
+# ---------------------------------------------------------------------------
+# Run Wrapper: Launch ANY arbitrary process with maximum resource acceleration
+# ---------------------------------------------------------------------------
+cmd_run() {
+  [[ $# -eq 0 ]] && { err "Usage: ${SCRIPT_NAME} run <command> [arguments...]"; exit 1; }
+
+  detect_resources
+
+  # Export parallel environment variables into current execution
+  export MAKEFLAGS="-j${CPU_CORES}"
+  export CMAKE_BUILD_PARALLEL_LEVEL="${CPU_CORES}"
+  export NINJA_STATUS="[%f/%t %s] "
+  export CARGO_BUILD_JOBS="${CPU_CORES}"
+  export OMP_NUM_THREADS="${CPU_CORES}"
+  export MKL_NUM_THREADS="${CPU_CORES}"
+  export OPENBLAS_NUM_THREADS="${CPU_CORES}"
+  export NUMEXPR_NUM_THREADS="${CPU_CORES}"
+  export XZ_OPT="-T0"
+  export ZSTD_NBTHREADS="0"
+
+  log "Launching boosted process with ${CPU_CORES} CPU threads: $*"
+
+  # Build execution command with best priority available
+  local prefix=()
+
+  # Set CPU affinity across all cores if taskset exists
+  if command -v taskset >/dev/null 2>&1; then
+    prefix+=(taskset -c "0-$((CPU_CORES - 1))")
+  fi
+
+  # Set high I/O scheduling priority if ionice exists
+  if command -v ionice >/dev/null 2>&1; then
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+      prefix+=(ionice -c 1 -n 0) # Real-time I/O priority for root
+    else
+      prefix+=(ionice -c 2 -n 0) # High Best-Effort I/O priority for normal user
+    fi
+  fi
+
+  # Set high CPU nice priority
+  if command -v nice >/dev/null 2>&1; then
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+      prefix+=(nice -n -10)
+    else
+      prefix+=(nice -n -5) 2>/dev/null || prefix+=(nice -n 0)
+    fi
+  fi
+
+  # Execute the target command
+  exec "${prefix[@]}" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# System Status & Diagnostic Inspector
+# ---------------------------------------------------------------------------
+cmd_status() {
+  detect_resources
+  echo -e "\n${C_BOLD}=== Performance Accelerator Status (${SCRIPT_NAME}) ===${C_RESET}"
+
+  # CPU Governor
+  local gov="Unknown"
+  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+    gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+  fi
+  printf "%-30s: %s (%s cores)\n" "CPU Governor" "${gov}" "${CPU_CORES}"
+
+  # VM swappiness
+  local swap="Default"
+  if [[ -f /proc/sys/vm/swappiness ]]; then
+    swap="$(cat /proc/sys/vm/swappiness)"
+  fi
+  printf "%-30s: %s (default: 60)\n" "RAM Swappiness" "${swap}"
+
+  # Multi-threaded compression tools
+  printf "%-30s: %s\n" "Parallel gzip (pigz)" "$(command -v pigz >/dev/null 2>&1 && echo 'Installed ✔' || echo 'Not installed')"
+  printf "%-30s: %s\n" "Parallel bzip2 (pbzip2)" "$(command -v pbzip2 >/dev/null 2>&1 && echo 'Installed ✔' || echo 'Not installed')"
+  printf "%-30s: %s\n" "Parallel xz (T0)" "$(echo "$XZ_OPT" 2>/dev/null || echo '-T0 ready')"
+
+  # ZRAM Status
+  if command -v zramctl >/dev/null 2>&1; then
+    echo -e "\n${C_BOLD}ZRAM Devices:${C_RESET}"
+    zramctl 2>/dev/null || echo "No active zram device."
+  fi
+
+  # Daemon Status
+  if command -v systemctl >/dev/null 2>&1; then
+    local svc_status
+    svc_status="$(systemctl is-active "${SCRIPT_NAME}.service" 2>/dev/null || echo "inactive")"
+    printf "%-30s: %s\n" "Optimizer Daemon" "${svc_status}"
+  fi
+
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Package Subcommands (Apt & Pip)
+# ---------------------------------------------------------------------------
+cmd_apt_upgrade() {
+  need_root
+  detect_resources
+  log "Updating package index..."
+  if command -v apt-fast >/dev/null 2>&1; then
+    apt-fast update -y 2>&1 | tee -a "$LOG_FILE"
+    log "Running full-upgrade with parallel segmented downloads..."
+    apt-fast full-upgrade -y 2>&1 | tee -a "$LOG_FILE"
+  else
+    apt-get update -y 2>&1 | tee -a "$LOG_FILE"
+    log "apt-fast not available — using apt with tuned pipeline depth."
+    apt-get -o Acquire::http::Pipeline-Depth=10 full-upgrade -y 2>&1 | tee -a "$LOG_FILE"
+  fi
+  ok "System upgrade complete."
+}
+
+cmd_apt_install() {
+  need_root
+  detect_resources
+  [[ $# -eq 0 ]] && { err "apt-install needs at least one package name."; exit 1; }
+  log "Installing ${#} package(s): $*"
+  if command -v apt-fast >/dev/null 2>&1; then
+    apt-fast install -y "$@" 2>&1 | tee -a "$LOG_FILE"
+  else
+    apt-get install -y "$@" 2>&1 | tee -a "$LOG_FILE"
+  fi
+  ok "apt install finished."
+}
+
+cmd_pip_install() {
+  detect_resources
+  [[ $# -eq 0 ]] && { err "pip-install needs at least one package name."; exit 1; }
+  ensure_tool parallel parallel
+  local pip_bin="pip3"; command -v pip3 >/dev/null 2>&1 || pip_bin="pip"
+  log "Installing ${#} pip package(s) in parallel (load-capped at ${LOAD_TARGET}%)..."
+  printf '%s\n' "$@" | parallel --bar --load "${LOAD_TARGET}%" --jobs "$JOBS" \
+    "$pip_bin install --user --disable-pip-version-check {}" 2>&1 | tee -a "$LOG_FILE"
+  ok "pip installs finished."
+}
+
+# ---------------------------------------------------------------------------
+# Daemon Management Subcommand
+# ---------------------------------------------------------------------------
+cmd_daemon() {
+  need_root
+  local action="${1:-status}"
+  case "$action" in
+    start)
+      systemctl start "${SCRIPT_NAME}.service"
+      ok "Daemon started."
+      ;;
+    stop)
+      systemctl stop "${SCRIPT_NAME}.service"
+      ok "Daemon stopped."
+      ;;
+    restart)
+      systemctl restart "${SCRIPT_NAME}.service"
+      ok "Daemon restarted."
+      ;;
+    status)
+      systemctl status "${SCRIPT_NAME}.service" --no-pager || true
+      ;;
+    *)
+      err "Unknown daemon action: ${action}. Use: start | stop | restart | status"
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Reversible Uninstall
+# ---------------------------------------------------------------------------
+cmd_uninstall() {
+  need_root
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "No ${SCRIPT_NAME} state record found — nothing to uninstall."
+    exit 0
+  fi
+  log "Reverting all ${SCRIPT_NAME} system modifications..."
+
+  # Stop and disable daemon
+  if systemctl is-active --quiet "${SCRIPT_NAME}.service" 2>/dev/null; then
+    systemctl stop "${SCRIPT_NAME}.service" 2>/dev/null || true
+    systemctl disable "${SCRIPT_NAME}.service" 2>/dev/null || true
+  fi
+
+  while IFS= read -r line; do
+    case "$line" in
+      RESTORE:*)
+        f="${line#RESTORE:}"
+        bak="${BACKUP_DIR}${f}.bak"
+        if [[ -f "$bak" ]]; then
+          cp -p "$bak" "$f"
+          ok "Restored original configuration: ${f}"
+        fi
+        ;;
+      DELETE:*)
+        f="${line#DELETE:}"
+        [[ -f "$f" || -L "$f" ]] && rm -f "$f" && ok "Removed generated file: ${f}"
+        ;;
+      PKG:*)
+        pkg="${line#PKG:}"
+        if [[ "$pkg" == "apt-fast" ]]; then
+          DEBIAN_FRONTEND=noninteractive apt-get purge -y apt-fast >>"$LOG_FILE" 2>&1 || true
+          add-apt-repository -y --remove ppa:apt-fast/stable >>"$LOG_FILE" 2>&1 || true
+          ok "Removed apt-fast and its repository."
+        fi
+        ;;
+    esac
+  done < "$STATE_FILE"
+
+  # Reload systemd and sysctl
+  systemctl daemon-reload 2>/dev/null || true
+  sysctl --system >>"$LOG_FILE" 2>&1 || true
+
+  rm -rf "$BACKUP_DIR" "$STATE_DIR"
+  ok "Uninstall complete. System restored to original configuration."
+}
+
+# ---------------------------------------------------------------------------
+# Help & CLI Router
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+${C_BOLD}${SCRIPT_NAME}${C_RESET} — Universal System & Process Performance Accelerator
+
+${C_CYAN}Commands:${C_RESET}
+  ${C_BOLD}sudo ${SCRIPT_NAME} setup${C_RESET}                 Optimize the entire system for maximum performance
+                                   (CPU governor, sysctl, environment multi-threading,
+                                    zram, pigz/pbzip2 drop-ins, and auto-booster daemon)
+  ${C_BOLD}${SCRIPT_NAME} run <command...> [args]${C_RESET}     Execute ANY arbitrary process with boosted CPU/IO
+                                   priority, affinity, and multi-thread limits
+  ${C_BOLD}${SCRIPT_NAME} status${C_RESET}                      Display current system performance & tuning status
+  ${C_BOLD}sudo ${SCRIPT_NAME} daemon {start|stop|status}${C_RESET} Manage the background process booster daemon
+  ${C_BOLD}sudo ${SCRIPT_NAME} apt-upgrade${C_RESET}               Parallel-downloaded full system package upgrade
+  ${C_BOLD}sudo ${SCRIPT_NAME} apt-install <pkg...>${C_RESET}      Install apt packages with parallel segmented downloads
+  ${C_BOLD}${SCRIPT_NAME} pip-install <pkg...>${C_RESET}          Install pip packages in parallel with load throttling
+  ${C_BOLD}sudo ${SCRIPT_NAME} --uninstall${C_RESET}               Revert all changes and restore original defaults
+
+${C_CYAN}Examples:${C_RESET}
+  sudo ${SCRIPT_NAME} setup
+  ${SCRIPT_NAME} run make -j8
+  ${SCRIPT_NAME} run ffmpeg -i video.mov output.mp4
+  ${SCRIPT_NAME} run python3 train.py
+  ${SCRIPT_NAME} status
+  sudo ${SCRIPT_NAME} apt-install build-essential cmake git
+  ${SCRIPT_NAME} pip-install numpy scipy torch torchvision
+  sudo ${SCRIPT_NAME} --uninstall
+EOF
+}
+
+main() {
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/${SCRIPT_NAME}.log"
+
+  [[ $# -eq 0 ]] && { usage; exit 1; }
+
+  case "$1" in
+    setup)                 shift; cmd_setup "$@";;
+    run)                   shift; cmd_run "$@";;
+    status)                shift; cmd_status "$@";;
+    daemon)                shift; cmd_daemon "$@";;
+    daemon-loop)           daemon_loop;;
+    apt-upgrade)           shift; cmd_apt_upgrade "$@";;
+    apt-install)           shift; cmd_apt_install "$@";;
+    pip-install)           shift; cmd_pip_install "$@";;
+    --uninstall|uninstall) cmd_uninstall;;
+    -h|--help)             usage;;
+    *)                     err "Unknown command: $1"; usage; exit 1;;
+  esac
+}
+
+main "$@"
